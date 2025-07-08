@@ -1,8 +1,8 @@
 """
-OpenAI provider implementation for the AI experimentation platform.
+Anthropic provider implementation for the AI experimentation platform.
 
-This module provides integration with OpenAI's API including GPT-3.5, GPT-4,
-and other OpenAI models with proper error handling and cost calculation.
+This module provides integration with Anthropic's Claude API including Claude-3 
+models with proper error handling and cost calculation.
 """
 
 import asyncio
@@ -10,12 +10,12 @@ from typing import List, Optional, Dict, Any
 import logging
 
 try:
-    from openai import AsyncOpenAI
-    from openai.types.chat import ChatCompletion
-    from openai import RateLimitError as OpenAIRateLimitError
-    from openai import AuthenticationError, APIError
+    from anthropic import AsyncAnthropic
+    from anthropic.types import Message
+    from anthropic import RateLimitError as AnthropicRateLimitError
+    from anthropic import AuthenticationError, APIError
 except ImportError:
-    raise ImportError("OpenAI package not found. Install with: pip install openai")
+    raise ImportError("Anthropic package not found. Install with: pip install anthropic")
 
 from .base import (
     BaseProvider, 
@@ -30,74 +30,69 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-class OpenAIProvider(BaseProvider):
+class AnthropicProvider(BaseProvider):
     """
-    OpenAI provider implementation.
+    Anthropic provider implementation.
     
-    Supports GPT-3.5, GPT-4, and other OpenAI models with comprehensive
-    error handling, cost calculation, and retry logic.
+    Supports Claude-3 models with comprehensive error handling, 
+    cost calculation, and retry logic.
     """
     
     # Current pricing per 1K tokens (as of July 2024)
     PRICING = {
-        'gpt-4': {'input': 0.03, 'output': 0.06},
-        'gpt-4-32k': {'input': 0.06, 'output': 0.12},
-        'gpt-4-turbo': {'input': 0.01, 'output': 0.03},
-        'gpt-4o': {'input': 0.005, 'output': 0.02},
-        'gpt-4o-mini': {'input': 0.00015, 'output': 0.0006},
-        'gpt-3.5-turbo': {'input': 0.0005, 'output': 0.0015},
-        'gpt-3.5-turbo-0125': {'input': 0.0005, 'output': 0.0015},
+        'claude-3-5-sonnet-20241022': {'input': 0.003, 'output': 0.015},
+        'claude-3-5-sonnet-20240620': {'input': 0.003, 'output': 0.015},
+        'claude-3-opus-20240229': {'input': 0.015, 'output': 0.075},
+        'claude-3-sonnet-20240229': {'input': 0.003, 'output': 0.015},
+        'claude-3-haiku-20240307': {'input': 0.00025, 'output': 0.00125},
     }
     
     def __init__(self, config: ProviderConfig):
-        """Initialize OpenAI provider."""
+        """Initialize Anthropic provider."""
         super().__init__(config)
         
-        # Initialize OpenAI client
+        # Initialize Anthropic client
         client_kwargs = {
             'api_key': config.api_key,
             'timeout': config.timeout,
             'max_retries': config.max_retries,
         }
         
-        if config.organization:
-            client_kwargs['organization'] = config.organization
-            
         if config.base_url:
             client_kwargs['base_url'] = config.base_url
             
-        self.client = AsyncOpenAI(**client_kwargs)
+        self.client = AsyncAnthropic(**client_kwargs)
         
-        self.logger.info(f"OpenAI provider initialized with timeout={config.timeout}s")
+        self.logger.info(f"Anthropic provider initialized with timeout={config.timeout}s")
     
     def _validate_config(self) -> None:
-        """Validate OpenAI configuration."""
+        """Validate Anthropic configuration."""
         if not self.config.api_key:
-            raise InvalidConfigError("OpenAI API key is required", "openai")
+            raise InvalidConfigError("Anthropic API key is required", "anthropic")
         
-        if not self.config.api_key.startswith('sk-'):
-            raise InvalidConfigError("OpenAI API key must start with 'sk-'", "openai")
+        if not self.config.api_key.startswith('sk-ant-'):
+            raise InvalidConfigError("Anthropic API key must start with 'sk-ant-'", "anthropic")
         
         if self.config.timeout <= 0:
-            raise InvalidConfigError("Timeout must be positive", "openai")
+            raise InvalidConfigError("Timeout must be positive", "anthropic")
     
     async def generate(
         self,
         prompt: str,
-        model: str = 'gpt-3.5-turbo',
+        model: str = 'claude-3-5-sonnet-20241022',
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         **kwargs
     ) -> AIResponse:
         """
-        Generate response using OpenAI's API.
+        Generate response using Anthropic's API.
         
         Args:
             prompt: Input prompt for the model
-            model: OpenAI model to use
-            temperature: Sampling temperature (0.0 to 2.0)
+            model: Anthropic model to use
+            temperature: Sampling temperature (0.0 to 1.0)
             max_tokens: Maximum tokens to generate
-            **kwargs: Additional OpenAI parameters
+            **kwargs: Additional Anthropic parameters
             
         Returns:
             AIResponse with generated content and metadata
@@ -115,75 +110,74 @@ class OpenAIProvider(BaseProvider):
                 'model': model,
                 'messages': [{'role': 'user', 'content': prompt}],
                 'temperature': temperature,
+                'max_tokens': max_tokens or 1000,  # Anthropic requires max_tokens
                 **kwargs
             }
-            
-            if max_tokens:
-                request_params['max_tokens'] = max_tokens
             
             # Make API call with retry logic
             response = await self._make_api_call(request_params)
             
             # Extract response data
-            content = response.choices[0].message.content
+            content = response.content[0].text
             usage = response.usage
             
             # Calculate cost
             cost = self._calculate_cost(
                 model=model,
-                prompt_tokens=usage.prompt_tokens,
-                completion_tokens=usage.completion_tokens
+                prompt_tokens=usage.input_tokens,
+                completion_tokens=usage.output_tokens
             )
             
             # Create standardized response
             ai_response = AIResponse(
                 content=content,
-                prompt_tokens=usage.prompt_tokens,
-                completion_tokens=usage.completion_tokens,
-                total_tokens=usage.total_tokens,
+                prompt_tokens=usage.input_tokens,
+                completion_tokens=usage.output_tokens,
+                total_tokens=usage.input_tokens + usage.output_tokens,
                 model=model,
                 cost_usd=cost,
-                provider="openai",
+                provider="anthropic",
                 metadata={
-                    'finish_reason': response.choices[0].finish_reason,
+                    'stop_reason': response.stop_reason,
                     'response_id': response.id,
-                    'created': response.created,
+                    'model': response.model,
+                    'role': response.role,
                     'temperature': temperature,
                     'max_tokens': max_tokens,
                 }
             )
             
             self.logger.info(
-                f"Generated response: {usage.total_tokens} tokens, "
-                f"${cost:.6f} cost, finish_reason={response.choices[0].finish_reason}"
+                f"Generated response: {usage.input_tokens + usage.output_tokens} tokens, "
+                f"${cost:.6f} cost, stop_reason={response.stop_reason}"
             )
             
             return ai_response
             
-        except OpenAIRateLimitError as e:
+        except AnthropicRateLimitError as e:
             self.logger.warning(f"Rate limit exceeded: {e}")
-            raise RateLimitError(str(e), "openai", model)
+            raise RateLimitError(str(e), "anthropic", model)
             
         except AuthenticationError as e:
             self.logger.error(f"Authentication failed: {e}")
-            raise InvalidConfigError(f"Invalid API key: {e}", "openai")
+            raise InvalidConfigError(f"Invalid API key: {e}", "anthropic")
             
         except APIError as e:
             if "model" in str(e).lower() and "not found" in str(e).lower():
-                raise ModelNotFoundError(f"Model {model} not found: {e}", "openai", model)
-            self.logger.error(f"OpenAI API error: {e}")
-            raise ProviderError(f"API error: {e}", "openai", model)
+                raise ModelNotFoundError(f"Model {model} not found: {e}", "anthropic", model)
+            self.logger.error(f"Anthropic API error: {e}")
+            raise ProviderError(f"API error: {e}", "anthropic", model)
             
         except Exception as e:
             self.logger.error(f"Unexpected error: {e}")
-            raise ProviderError(f"Unexpected error: {e}", "openai", model)
+            raise ProviderError(f"Unexpected error: {e}", "anthropic", model)
     
-    async def _make_api_call(self, params: Dict[str, Any]) -> ChatCompletion:
+    async def _make_api_call(self, params: Dict[str, Any]) -> Message:
         """Make API call with exponential backoff retry."""
         for attempt in range(self.config.max_retries + 1):
             try:
-                return await self.client.chat.completions.create(**params)
-            except OpenAIRateLimitError:
+                return await self.client.messages.create(**params)
+            except AnthropicRateLimitError:
                 if attempt == self.config.max_retries:
                     raise
                 wait_time = 2 ** attempt
@@ -199,8 +193,8 @@ class OpenAIProvider(BaseProvider):
     def _calculate_cost(self, model: str, prompt_tokens: int, completion_tokens: int) -> float:
         """Calculate cost based on token usage and model pricing."""
         if model not in self.PRICING:
-            self.logger.warning(f"Unknown model '{model}', using gpt-3.5-turbo pricing")
-            model = 'gpt-3.5-turbo'
+            self.logger.warning(f"Unknown model '{model}', using claude-3-5-sonnet pricing")
+            model = 'claude-3-5-sonnet-20241022'
         
         pricing = self.PRICING[model]
         input_cost = (prompt_tokens / 1000) * pricing['input']
@@ -209,7 +203,7 @@ class OpenAIProvider(BaseProvider):
         return input_cost + output_cost
     
     def get_available_models(self) -> List[str]:
-        """Get list of supported OpenAI models."""
+        """Get list of supported Anthropic models."""
         return list(self.PRICING.keys())
     
     def estimate_cost(
@@ -223,7 +217,7 @@ class OpenAIProvider(BaseProvider):
         
         Args:
             prompt: Input prompt
-            model: OpenAI model name
+            model: Anthropic model name
             max_tokens: Maximum tokens to generate
             
         Returns:
@@ -237,4 +231,4 @@ class OpenAIProvider(BaseProvider):
             model=model,
             prompt_tokens=estimated_prompt_tokens,
             completion_tokens=estimated_completion_tokens
-        ) 
+        )
